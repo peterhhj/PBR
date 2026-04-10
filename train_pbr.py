@@ -5,89 +5,76 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 import torch
 import torchvision.transforms as T
 from PIL import Image
-from argparse import ArgumentParser
+from argparse import ArgumentParser, Namespace
 from tqdm import tqdm
 import math
 import numpy as np
-from scipy.spatial import cKDTree
+import random
+import json
 
-# 导入 3DGS 核心组件
 from scene.gaussian_model import GaussianModel
-from scene.cameras import Camera
 from gaussian_renderer import render_pbr
+from scene.dataset_readers import sceneLoadTypeCallbacks
+from utils.camera_utils import cameraList_from_camInfos
 
-# 导入我们自定义的 PBR 模块
 from pbr_modules.predictor import PBRMaterialPredictor
 from pbr_modules.brdf_renderer import render_pbr_image
 from pbr_modules.style_loss import VGGStyleLoss
 
+def compute_knn_cpu(xyz_tensor, k=21, chunk_size=2000):
+    N = xyz_tensor.shape[0]
+    neighbor_indices = torch.zeros((N, k-1), dtype=torch.long, device="cpu")
+    print(f"正在 CPU 上分块计算 KNN (共 {N} 个点)...")
+    for i in tqdm(range(0, N, chunk_size), desc="KNN 构建"):
+        end = min(i + chunk_size, N)
+        dist = torch.cdist(xyz_tensor[i:end], xyz_tensor)
+        _, indices = torch.topk(dist, k=k, dim=1, largest=False)
+        neighbor_indices[i:end] = indices[:, 1:]
+    return neighbor_indices
+
 def load_style_image(image_path, device="cuda"):
-    """加载风格参考图并预处理"""
     img = Image.open(image_path).convert('RGB')
     transform = T.Compose([
-        T.Resize((512, 512)), # 统一大小便于计算 Gram 矩阵
+        T.CenterCrop(min(img.size)), 
+        T.Resize((512, 512)), 
         T.ToTensor()
     ])
     return transform(img).unsqueeze(0).to(device)
 
-def get_dummy_camera(device="cuda"):
-    """
-    为了简化测试，生成一个正面的虚拟相机视角进行渲染。
-    完美适配带有 Depth 参数的 Camera 类。
-    """
-    import math
-    import numpy as np
-    from PIL import Image
-
-    R = np.eye(3, dtype=np.float32)
-    T_vec = np.array([0, 0, 3.0], dtype=np.float32) # 相机往后退 3 个单位
-    
-    # 构造一个真实的 PIL 图像对象以防止 PILtoTorch 报错
-    dummy_image = Image.new("RGB", (800, 800), (0, 0, 0))
-    
-    # 填补缺少的三个必填参数：resolution, depth_params, invdepthmap
-    cam = Camera(
-        resolution=(800, 800),   # 新增
-        colmap_id=0, 
-        R=R, 
-        T=T_vec, 
-        FoVx=math.pi/3, 
-        FoVy=math.pi/3, 
-        depth_params=None,       # 新增：设为空
-        image=dummy_image,       # 修改：传入真实的 PIL 对象
-        invdepthmap=None,        # 新增：设为空
-        image_name="dummy", 
-        uid=0, 
-        data_device=device
-    )
-    return cam
-
-def train_pbr_stylization(ply_path, style_image_path, iterations=3000):
+def train_pbr_stylization(ply_path, source_path, style_image_path, iterations=3000):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
-    print("1. 初始化高斯模型并加载冻结的 PLY...")
+    print("1. 读取相机及数据集参数...")
+    is_synthetic = os.path.exists(os.path.join(source_path, "transforms_train.json"))
+    if os.path.exists(os.path.join(source_path, "sparse")):
+        scene_info = sceneLoadTypeCallbacks["Colmap"](source_path, "images", eval=False, train_test_exp=False, depths="")
+    elif is_synthetic:
+        scene_info = sceneLoadTypeCallbacks["Blender"](source_path, "white", eval=False, train_test_exp=False, depths="")
+    
+    cam_args = Namespace(resolution=1, data_device=device, train_test_exp=False)
+    train_cameras = cameraList_from_camInfos(scene_info.train_cameras, 1.0, cam_args, is_nerf_synthetic=is_synthetic, is_test_dataset=False)
+    
+    camera_params_path = os.path.join(source_path, "camera_params.json")
+    exact_obj_center = None
+    if os.path.exists(camera_params_path):
+        with open(camera_params_path, 'r') as f:
+            exact_obj_center = torch.tensor(json.load(f)["center"], dtype=torch.float32, device=device)
+
+    print("2. 初始化模型...")
     gaussians = GaussianModel(sh_degree=0)
     gaussians.load_ply(ply_path)
     
-    # ========== 新增：CPU 预计算 KNN 邻接图 ==========
-    print("1.5. 使用 KDTree 预计算全局 KNN 图 (防止OOM)...")
-    xyz_np = gaussians.get_xyz.detach().cpu().numpy()
-    tree = cKDTree(xyz_np)
-    # k=21 因为第 0 个最近邻是点本身，我们需要排除它
-    _, indices = tree.query(xyz_np, k=21, workers=-1)
-    # 取后 20 个邻居，并转移到 GPU
-    neighbor_indices = torch.tensor(indices[:, 1:], dtype=torch.long, device=device)
-    # ================================================
+    if exact_obj_center is None:
+        exact_obj_center = gaussians.get_xyz.mean(dim=0)
 
-    print("2. 初始化 3D-GCN 材质预测网络...")
-    predictor = PBRMaterialPredictor(in_channels=6).to(device)
+    xyz_cpu = gaussians.get_xyz.detach().cpu()
+    neighbor_indices = compute_knn_cpu(xyz_cpu, k=11, chunk_size=2000).to(device)
+
+    predictor = PBRMaterialPredictor(in_channels=6, support_num=4, neighbor_num=10).to(device)
     optimizer = torch.optim.Adam(predictor.parameters(), lr=1e-3)
     
-    print("3. 初始化 VGG 风格损失与参考图...")
     style_target = load_style_image(style_image_path, device)
     vgg_loss = VGGStyleLoss(device=device)
-    
-    # 固定的背景色
     bg_color = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32, device=device)
     
     print("--- 开始训练 ---")
@@ -97,69 +84,86 @@ def train_pbr_stylization(ply_path, style_image_path, iterations=3000):
         predictor.train()
         optimizer.zero_grad()
         
-        # 步骤 A：3D-GCN 预测 PBR 参数 (注意这里传入了 neighbor_indices)
-        albedo_logits, rough_logits, metal_logits = predictor(
-            gaussians.get_xyz, 
-            gaussians.get_scaling, 
-            neighbor_indices
-        )
-        
-        pred_albedo = torch.sigmoid(albedo_logits)
-        pred_roughness = torch.clamp(torch.sigmoid(rough_logits), min=0.04, max=1.0)
+        albedo_logits, rough_logits, metal_logits = predictor(gaussians.get_xyz, gaussians.get_scaling, neighbor_indices)
+        pred_albedo = torch.sigmoid(albedo_logits) * 0.95 + 0.05 
+        pred_roughness = torch.sigmoid(rough_logits) * 0.96 + 0.04 
         pred_metallic = torch.sigmoid(metal_logits)
         
-        # 步骤 B：获取相机视角并渲染 G-Buffer
-        view_cam = get_dummy_camera(device)
-        
+        view_cam = random.choice(train_cameras)
         render_pkg = render_pbr(
-            viewpoint_camera=view_cam, 
-            pc=gaussians, 
-            pipe=None, 
-            bg_color=bg_color,
-            override_albedo=pred_albedo,
-            override_roughness=pred_roughness,
-            override_metallic=pred_metallic
+            viewpoint_camera=view_cam, pc=gaussians, pipe=None, bg_color=bg_color,
+            override_albedo=pred_albedo, override_roughness=pred_roughness, override_metallic=pred_metallic
         )
         
-        # 步骤 C：物理延迟着色
-        light_dir = torch.tensor([1.0, 1.0, 1.0], device=device)
-        light_color = torch.tensor([5.0, 5.0, 5.0], device=device)
-        view_dir = torch.tensor([0.0, 0.0, 1.0], device=device) 
+        # ================= 核心修复 1：重塑 3D 立体光影 =================
+        cam_pos = view_cam.camera_center
+        view_dir = torch.nn.functional.normalize(cam_pos - exact_obj_center, dim=0)
+        
+        # 主光源 (Key Light)：拉开与视线的角度，从右上方斜打过来，制造强烈的立体阴影！
+        light_dir = torch.nn.functional.normalize(view_dir + torch.tensor([1.2, 1.5, 0.0], device=device), dim=0)
+        light_color = torch.tensor([6.0, 6.0, 6.0], device=device)
         
         shaded_image = render_pbr_image(
-            albedo=render_pkg["albedo"],
-            roughness=render_pkg["roughness"],
-            metallic=render_pkg["metallic"],
-            normal=render_pkg["normal"],
-            view_dir=view_dir.view(3, 1, 1),
-            light_dir=light_dir.view(3, 1, 1),
-            light_color=light_color.view(3, 1, 1)
+            albedo=render_pkg["albedo"], roughness=render_pkg["roughness"], metallic=render_pkg["metallic"],
+            normal=render_pkg["normal"], view_dir=view_dir.view(3, 1, 1), 
+            light_dir=light_dir.view(3, 1, 1), light_color=light_color.view(3, 1, 1)
         )
         
-        # 步骤 D：计算风格损失并反向传播
-        shaded_resized = T.functional.resize(shaded_image, (512, 512))
+        # 环境光 (Ambient Light)：防止背光面变成死黑，补充全局柔和体积感
+        ambient_light = render_pkg["albedo"] * 0.15
+        shaded_image = torch.clamp(shaded_image + ambient_light, 0.0, 1.0)
+        # ================================================================
+
+        # ================= 核心修复 2：柔和平滑掩码 (Soft Mask) =================
+        # 用 albedo 的亮度渐变做软掩码，保留高斯渲染的羽化边缘，告别狗牙抠图感
+        albedo_max, _ = torch.max(render_pkg["albedo"], dim=0)
+        soft_mask = torch.clamp(albedo_max * 3.0, 0.0, 1.0).unsqueeze(0)
         
-        loss = vgg_loss(shaded_resized, style_target)
-        loss.backward()
+        # 边界框裁剪仍用二值判断，以确保安全
+        binary_mask = (albedo_max > 0.01)
+        nonzero_indices = torch.nonzero(binary_mask)
         
+        if nonzero_indices.numel() > 100:
+            y_min, y_max = nonzero_indices[:, 0].min(), nonzero_indices[:, 0].max()
+            x_min, x_max = nonzero_indices[:, 1].min(), nonzero_indices[:, 1].max()
+            cropped_shaded = shaded_image[:, y_min:y_max+1, x_min:x_max+1]
+        else:
+            cropped_shaded = shaded_image
+        # ========================================================================
+            
+        shaded_resized = T.functional.resize(cropped_shaded, (512, 512))
+        style_loss = vgg_loss(shaded_resized, style_target)
+        
+        loss_metallic = torch.mean(pred_metallic) 
+        loss_roughness = torch.mean((pred_roughness - 0.15) ** 2) 
+
+        total_loss = style_loss + (0.0005 * loss_metallic) + (0.001 * loss_roughness)
+        
+        total_loss.backward()
         optimizer.step()
         
-        # 打印日志
         if iteration % 10 == 0:
-            progress_bar.set_postfix({"Style Loss": f"{loss.item():.{5}f}"})
+            progress_bar.set_postfix({
+                "Tot": f"{total_loss.item():.4f}", 
+                "Sty": f"{style_loss.item():.4f}",
+                "Rgh": f"{loss_roughness.item():.4f}"
+            })
             
-        # 每隔 500 步保存一张当前渲染的图片用于观察效果
-        if iteration % 500 == 0:
+        if iteration == 1 or iteration % 100 == 0:
+            print(f"\n--- [DEBUG] Iter: {iteration} ---")
+            print(f"Albedo   均值: {pred_albedo.mean().item():.4f}")
+            print(f"Rough    均值: {pred_roughness.mean().item():.4f}")
+            
+        # ================= 核心修复 3：完美融合白色背景 =================
+        if iteration == 1 or iteration % 500 == 0:
             os.makedirs("pbr_outputs", exist_ok=True)
-            save_img = T.ToPILImage()(torch.clamp(shaded_image, 0.0, 1.0).detach().cpu())
-            save_img.save(f"pbr_outputs/iter_{iteration}.png")
-            
-            # 保存当前的 GCN 模型权重
-            torch.save(predictor.state_dict(), f"pbr_outputs/predictor_{iteration}.pth")
+            # 使用 soft_mask 平滑过渡：中心不透明，边缘半透明融合白色
+            white_bg_image = shaded_image * soft_mask + 1.0 * (1.0 - soft_mask)
+            img_tensor = torch.clamp(white_bg_image, 0.0, 1.0).detach().cpu()
+            if not torch.isnan(img_tensor).any():
+                T.ToPILImage()(img_tensor).save(f"pbr_outputs/iter_{iteration}.png")
 
-    # 训练结束后，保存包含 PBR 属性的 3DGS 模型
     print("保存带 PBR 材质的最终 3DGS 模型...")
-    # 把预测出的最终材质属性赋给 gaussians 内部的张量
     gaussians._albedo.data = pred_albedo.detach()
     gaussians._roughness.data = pred_roughness.detach()
     gaussians._metallic.data = pred_metallic.detach()
@@ -167,11 +171,10 @@ def train_pbr_stylization(ply_path, style_image_path, iterations=3000):
     print("保存成功！")
 
 if __name__ == "__main__":
-    parser = ArgumentParser(description="Train PBR Material Predictor for 3DGS")
-    parser.add_argument("--ply_path", type=str, required=True, help="Path to the frozen pre-trained .ply file")
-    parser.add_argument("--style_image", type=str, required=True, help="Path to the target material image")
-    parser.add_argument("--iterations", type=int, default=3000, help="Training iterations")
-    
+    parser = ArgumentParser()
+    parser.add_argument("--ply_path", type=str, required=True)
+    parser.add_argument("--source", type=str, required=True)
+    parser.add_argument("--style_image", type=str, required=True)
+    parser.add_argument("--iterations", type=int, default=3000)
     args = parser.parse_args()
-    
-    train_pbr_stylization(args.ply_path, args.style_image, args.iterations)
+    train_pbr_stylization(args.ply_path, args.source, args.style_image, args.iterations)
