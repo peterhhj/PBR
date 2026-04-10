@@ -25,3 +25,7 @@ python train_pbr.py --ply_path point_cloud.ply --style_image jade.jpg --iteratio
 8.sheenTint，用于控制sheen分量颜色向基本颜色靠拢的程度，默认值为0.5。
 9.clearcoat，模拟清漆的效果，类似于镀了一层膜的效果，默认值为0，
 10.clearcoatGloss，用于控制清漆的光滑程度，默认值为1
+
+
+
+python train_pbr.py --ply_path <your_ply> --source <your_dataset> --style_image jade.jpg --material_preset jade --warmup_iters 800 --views_per_iter 1

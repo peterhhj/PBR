@@ -46,6 +46,7 @@ class Camera(nn.Module):
             self.alpha_mask = resized_image_rgb[3:4, ...].to(self.data_device)
         else: 
             self.alpha_mask = torch.ones_like(resized_image_rgb[0:1, ...].to(self.data_device))
+        self.gt_alpha_mask = self.alpha_mask
 
         if train_test_exp and is_test_view:
             if is_test_dataset:

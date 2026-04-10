@@ -1,76 +1,145 @@
-import sys
+import math
 import os
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+from argparse import ArgumentParser
 
 import torch
-import math
 from tqdm import tqdm
-import torchvision.transforms as T
 
-# 导入核心组件
+from gaussian_renderer import render
+from pbr import CubemapLight, get_brdf_lut, pbr_shading
+from scene.cameras import MiniCam
 from scene.gaussian_model import GaussianModel
-from gaussian_renderer import render_pbr
-from pbr_modules.brdf_renderer import render_pbr_image
-from train_pbr import get_dummy_camera  # 复用我们之前的虚拟相机
+from utils.graphics_utils import getProjectionMatrix
 
-def render_pbr_showcase(ply_path, output_dir="showcase_frames", num_frames=100):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+def save_tensor_image(image: torch.Tensor, path: str) -> None:
+    from PIL import Image
+    import numpy as np
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    image = image.detach().clamp(0.0, 1.0).cpu().permute(1, 2, 0).numpy()
+    Image.fromarray((image * 255).astype(np.uint8)).save(path)
+
+
+def make_orbit_camera(
+    center: torch.Tensor,
+    radius: float,
+    angle: float,
+    elevation: float,
+    resolution: int,
+    device: torch.device,
+) -> MiniCam:
+    cam_pos = center + torch.tensor(
+        [
+            radius * math.cos(elevation) * math.sin(angle),
+            radius * math.sin(elevation),
+            radius * math.cos(elevation) * math.cos(angle),
+        ],
+        dtype=torch.float32,
+        device=device,
+    )
+    forward = torch.nn.functional.normalize(center - cam_pos, dim=0)
+    world_up = torch.tensor([0.0, 1.0, 0.0], dtype=torch.float32, device=device)
+    right = torch.nn.functional.normalize(torch.cross(world_up, forward, dim=0), dim=0)
+    up = torch.nn.functional.normalize(torch.cross(forward, right, dim=0), dim=0)
+
+    c2w = torch.eye(4, dtype=torch.float32, device=device)
+    c2w[:3, 0] = right
+    c2w[:3, 1] = up
+    c2w[:3, 2] = forward
+    c2w[:3, 3] = cam_pos
+
+    w2c = torch.inverse(c2w)
+    world_view_transform = w2c.transpose(0, 1).contiguous()
+    fov = math.radians(50.0)
+    projection_matrix = getProjectionMatrix(znear=0.01, zfar=100.0, fovX=fov, fovY=fov).transpose(0, 1).to(device)
+    full_proj_transform = world_view_transform.unsqueeze(0).bmm(projection_matrix.unsqueeze(0)).squeeze(0)
+    return MiniCam(
+        width=resolution,
+        height=resolution,
+        fovy=fov,
+        fovx=fov,
+        znear=0.01,
+        zfar=100.0,
+        world_view_transform=world_view_transform,
+        full_proj_transform=full_proj_transform,
+    )
+
+
+def get_view_dirs(camera: MiniCam) -> torch.Tensor:
+    H, W = camera.image_height, camera.image_width
+    cen_x = W / 2.0
+    cen_y = H / 2.0
+    focal = W / (2.0 * math.tan(camera.FoVx * 0.5))
+    x, y = torch.meshgrid(
+        torch.arange(W, device=camera.camera_center.device),
+        torch.arange(H, device=camera.camera_center.device),
+        indexing="xy",
+    )
+    canonical = torch.nn.functional.pad(
+        torch.stack([(x.flatten() - cen_x + 0.5) / focal, (y.flatten() - cen_y + 0.5) / focal], dim=-1),
+        (0, 1),
+        value=1.0,
+    )
+    c2w = torch.inverse(camera.world_view_transform.T)
+    return -(
+        (torch.nn.functional.normalize(canonical[:, None, :], p=2, dim=-1) * c2w[None, :3, :3])
+        .sum(dim=-1)
+        .reshape(H, W, 3)
+    )
+
+
+def render_pbr_showcase(
+    ply_path: str,
+    output_dir: str = "showcase_frames",
+    num_frames: int = 120,
+    resolution: int = 512,
+    env_name: str = "studio",
+) -> None:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(output_dir, exist_ok=True)
-    
-    print(f"1. 加载 PBR 材质模型: {ply_path} ...")
-    gaussians = GaussianModel(sh_degree=0)
+
+    gaussians = GaussianModel(sh_degree=3)
     gaussians.load_ply(ply_path)
-    
-    # 获取正面视角相机
-    view_cam = get_dummy_camera(device)
-    bg_color = torch.tensor([0.05, 0.05, 0.05], dtype=torch.float32, device=device) # 暗灰色背景
-    
-    print("2. 渲染 G-Buffer (只需渲染一次，因为相机没动)...")
-    with torch.no_grad():
-        render_pkg = render_pbr(
-            viewpoint_camera=view_cam, 
-            pc=gaussians, 
-            pipe=None, 
-            bg_color=bg_color
+    center = gaussians.get_xyz.mean(dim=0)
+    radius = torch.norm(gaussians.get_xyz - center, dim=-1).max().item() * 2.5
+
+    light = CubemapLight.from_preset(env_name, resolution=128, device=device)
+    light.build_mips()
+    brdf_lut = get_brdf_lut()
+
+    for frame_idx in tqdm(range(num_frames), desc="Rendering showcase"):
+        angle = (frame_idx / max(num_frames, 1)) * 2.0 * math.pi
+        camera = make_orbit_camera(center, radius, angle, math.radians(20.0), resolution, device)
+        render_pkg = render(camera, gaussians, bg_color=torch.zeros(3, dtype=torch.float32, device=device))
+        pbr_result = pbr_shading(
+            light=light,
+            normals=render_pkg["normal_map"].permute(1, 2, 0),
+            view_dirs=get_view_dirs(camera),
+            albedo=render_pkg["albedo_map"].permute(1, 2, 0),
+            roughness=render_pkg["roughness_map"].permute(1, 2, 0),
+            metallic=render_pkg["metallic_map"].permute(1, 2, 0),
+            mask=render_pkg["normal_mask"].permute(1, 2, 0),
+            brdf_lut=brdf_lut,
         )
-        
-    print(f"3. 生成 {num_frames} 帧动态光照动画...")
-    # 模拟一个从正面看过来的视线方向
-    view_dir = torch.tensor([0.0, 0.0, 1.0], device=device).view(3, 1, 1)
-    # 光照强度
-    light_color = torch.tensor([6.0, 6.0, 6.0], device=device).view(3, 1, 1) 
-    
-    progress_bar = tqdm(range(num_frames), desc="Rendering Frames")
-    for i in progress_bar:
-        # 让灯光绕着 Y 轴（垂直方向）旋转
-        angle = (i / num_frames) * 2 * math.pi
-        light_x = math.sin(angle)
-        light_y = 0.5  # 光源稍微偏上一点
-        light_z = math.cos(angle)
-        
-        light_dir = torch.tensor([light_x, light_y, light_z], device=device).view(3, 1, 1)
-        
-        # 物理着色
-        shaded_image = render_pbr_image(
-            albedo=render_pkg["albedo"],
-            roughness=render_pkg["roughness"],
-            metallic=render_pkg["metallic"],
-            normal=render_pkg["normal"],
-            view_dir=view_dir,
-            light_dir=light_dir,
-            light_color=light_color
-        )
-        
-        # 保存图片
-        save_img = T.ToPILImage()(torch.clamp(shaded_image, 0.0, 1.0).detach().cpu())
-        save_img.save(os.path.join(output_dir, f"frame_{i:03d}.png"))
-        
-    print(f"\n渲染完成！请前往 '{output_dir}' 文件夹查看图片序列。")
+        image = pbr_result["render_rgb"].permute(2, 0, 1)
+        image = image * render_pkg["opacity_map"] + (1.0 - render_pkg["opacity_map"])
+        save_tensor_image(image, os.path.join(output_dir, f"frame_{frame_idx:03d}.png"))
+
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser()
+    parser = ArgumentParser()
     parser.add_argument("--ply", type=str, default="pbr_outputs/final_pbr_model.ply")
+    parser.add_argument("--output_dir", type=str, default="showcase_frames")
+    parser.add_argument("--num_frames", type=int, default=120)
+    parser.add_argument("--resolution", type=int, default=512)
+    parser.add_argument("--env_name", type=str, default="studio")
     args = parser.parse_args()
-    
-    render_pbr_showcase(args.ply)
+
+    render_pbr_showcase(
+        ply_path=args.ply,
+        output_dir=args.output_dir,
+        num_frames=args.num_frames,
+        resolution=args.resolution,
+        env_name=args.env_name,
+    )
