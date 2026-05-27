@@ -42,6 +42,18 @@ def linear_to_srgb(linear: Union[np.ndarray, torch.Tensor]) -> Union[np.ndarray,
     return np.where(linear <= 0.0031308, srgb0, srgb1)
 
 
+def srgb_to_linear(srgb: Union[np.ndarray, torch.Tensor]) -> Union[np.ndarray, torch.Tensor]:
+    if isinstance(srgb, torch.Tensor):
+        srgb = srgb.clamp(min=0.0, max=1.0)
+        linear0 = srgb / 12.92
+        linear1 = torch.pow((srgb + 0.055) / 1.055, 2.4)
+        return torch.where(srgb <= 0.04045, linear0, linear1)
+    srgb = np.clip(srgb, 0.0, 1.0)
+    linear0 = srgb / 12.92
+    linear1 = np.power((srgb + 0.055) / 1.055, 2.4)
+    return np.where(srgb <= 0.04045, linear0, linear1)
+
+
 def get_brdf_lut(search_root: Optional[str] = None) -> Optional[torch.Tensor]:
     candidate_paths = [os.path.join(os.path.dirname(__file__), "brdf_256_256.bin")]
     if search_root is not None:

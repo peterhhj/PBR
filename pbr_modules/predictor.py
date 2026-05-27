@@ -3,6 +3,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 class MemoryEfficientGCNLayer(nn.Module):
@@ -28,34 +29,65 @@ class MemoryEfficientGCNLayer(nn.Module):
         vertices: torch.Tensor,
         feature_map: torch.Tensor,
         neighbor_index: torch.Tensor,
-        chunk_size: int = 4096,
+        chunk_size: int = 1024,
     ) -> torch.Tensor:
         N, neighbor_num = neighbor_index.shape
-        feature_out = torch.matmul(feature_map, self.weights) + self.bias
-        feature_center = feature_out[:, : self.out_channel]
-        feature_support = feature_out[:, self.out_channel :]
+        chunk_size = max(int(chunk_size), 1)
+        weight_center = self.weights[:, : self.out_channel]
+        weight_support = self.weights[:, self.out_channel :]
+        bias_center = self.bias[: self.out_channel]
+        bias_support = self.bias[self.out_channel :]
         support_direction_norm = F.normalize(self.directions, dim=0)
 
-        outputs = []
+        outputs = feature_map.new_empty((N, self.out_channel))
         for start in range(0, N, chunk_size):
             end = min(start + chunk_size, N)
             v_chunk = vertices[start:end]
             idx_chunk = neighbor_index[start:end]
+            center_features = torch.matmul(feature_map[start:end], weight_center) + bias_center
 
             neighbors_coords = vertices[idx_chunk]
-            neighbors_features = feature_support[idx_chunk]
+            neighbors_input = feature_map[idx_chunk]
 
             neighbor_direction = neighbors_coords - v_chunk.unsqueeze(1)
             neighbor_direction_norm = F.normalize(neighbor_direction, dim=-1)
-            theta = self.relu(torch.matmul(neighbor_direction_norm, support_direction_norm))
 
-            activation_support = theta * neighbors_features
-            activation_support = activation_support.view(-1, neighbor_num, self.support_num, self.out_channel)
-            activation_support = torch.max(activation_support, dim=2).values
-            activation_support = torch.sum(activation_support, dim=1)
-            outputs.append(feature_center[start:end] + activation_support)
+            max_support_activation = None
+            for support_idx in range(self.support_num):
+                channel_start = support_idx * self.out_channel
+                channel_end = channel_start + self.out_channel
+                support_dir_chunk = support_direction_norm[:, channel_start:channel_end]
+                support_weight_chunk = weight_support[:, channel_start:channel_end]
+                support_bias_chunk = bias_support[channel_start:channel_end]
 
-        return torch.cat(outputs, dim=0)
+                theta = self.relu(torch.matmul(neighbor_direction_norm, support_dir_chunk))
+                support_features = torch.matmul(neighbors_input, support_weight_chunk) + support_bias_chunk
+                support_activation = theta * support_features
+
+                if max_support_activation is None:
+                    max_support_activation = support_activation
+                else:
+                    max_support_activation = torch.maximum(max_support_activation, support_activation)
+
+                del support_dir_chunk
+                del support_weight_chunk
+                del support_bias_chunk
+                del theta
+                del support_features
+                del support_activation
+
+            activation_support = torch.sum(max_support_activation, dim=1)
+            outputs[start:end] = center_features + activation_support
+
+            del center_features
+            del neighbors_coords
+            del neighbors_input
+            del neighbor_direction
+            del neighbor_direction_norm
+            del max_support_activation
+            del activation_support
+
+        return outputs
 
 
 class PBRMaterialPredictor(nn.Module):
@@ -91,6 +123,8 @@ class PBRMaterialPredictor(nn.Module):
         scaling: torch.Tensor,
         neighbor_indices: torch.Tensor,
         style_code: torch.Tensor,
+        graph_conv_chunk_size: int = 1024,
+        use_checkpoint: bool = True,
     ):
         idx = neighbor_indices[:, : self.neighbor_num]
 
@@ -99,8 +133,15 @@ class PBRMaterialPredictor(nn.Module):
         log_scaling = torch.log(scaling.clamp(min=1e-6))
         features = torch.cat([xyz_norm, log_scaling], dim=-1)
 
-        x = F.relu(self.conv1(xyz, features, idx))
-        x = F.relu(self.conv2(xyz, x, idx))
+        x = F.relu(self.conv1(xyz, features, idx, chunk_size=graph_conv_chunk_size))
+        if use_checkpoint and x.requires_grad:
+            conv2_out = checkpoint(
+                lambda feat: self.conv2(xyz, feat, idx, chunk_size=graph_conv_chunk_size),
+                x,
+            )
+        else:
+            conv2_out = self.conv2(xyz, x, idx, chunk_size=graph_conv_chunk_size)
+        x = F.relu(conv2_out)
 
         if style_code.ndim == 1:
             style_code = style_code.unsqueeze(0)

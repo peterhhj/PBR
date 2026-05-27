@@ -1,4 +1,5 @@
 import math
+import inspect
 from typing import Dict, Optional
 
 import torch
@@ -70,22 +71,29 @@ def render(
         pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=False, device=pc.get_xyz.device
     )
 
-    raster_settings = GaussianRasterizationSettings(
-        image_height=int(viewpoint_camera.image_height),
-        image_width=int(viewpoint_camera.image_width),
-        tanfovx=math.tan(viewpoint_camera.FoVx * 0.5),
-        tanfovy=math.tan(viewpoint_camera.FoVy * 0.5),
-        bg=bg_color,
-        scale_modifier=scaling_modifier,
-        viewmatrix=viewpoint_camera.world_view_transform,
-        projmatrix=viewpoint_camera.full_proj_transform,
-        sh_degree=pc.active_sh_degree,
-        campos=viewpoint_camera.camera_center,
-        prefiltered=False,
-        debug=False,
-        inference=inference,
-        argmax_depth=False,
-    )
+    settings_kwargs = {
+        "image_height": int(viewpoint_camera.image_height),
+        "image_width": int(viewpoint_camera.image_width),
+        "tanfovx": math.tan(viewpoint_camera.FoVx * 0.5),
+        "tanfovy": math.tan(viewpoint_camera.FoVy * 0.5),
+        "bg": bg_color,
+        "scale_modifier": scaling_modifier,
+        "viewmatrix": viewpoint_camera.world_view_transform,
+        "projmatrix": viewpoint_camera.full_proj_transform,
+        "sh_degree": pc.active_sh_degree,
+        "campos": viewpoint_camera.camera_center,
+        "prefiltered": False,
+        "debug": False,
+        "inference": inference,
+        "argmax_depth": False,
+        "antialiasing": False,
+    }
+    supported_setting_fields = getattr(GaussianRasterizationSettings, "_fields", None)
+    if supported_setting_fields is not None:
+        settings_kwargs = {
+            key: value for key, value in settings_kwargs.items() if key in supported_setting_fields
+        }
+    raster_settings = GaussianRasterizationSettings(**settings_kwargs)
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
@@ -101,31 +109,67 @@ def render(
     scales = pc.get_scaling
     rotations = pc.get_rotation
 
-    (
-        rendered_image,
-        radii,
-        opacity_map,
-        depth_map,
-        normal_map,
-        albedo_map,
-        roughness_map,
-        metallic_map,
-    ) = rasterizer(
-        means3D=means3D,
-        means2D=means2D,
-        opacities=opacity,
-        normal=normal,
-        shs=shs,
-        colors_precomp=colors_precomp,
-        albedo=albedo,
-        roughness=roughness,
-        metallic=metallic,
-        scales=scales,
-        rotations=rotations,
-        cov3D_precomp=None,
-    )
+    rasterizer_kwargs = {
+        "means3D": means3D,
+        "means2D": means2D,
+        "opacities": opacity,
+        "normal": normal,
+        "shs": shs,
+        "colors_precomp": colors_precomp,
+        "albedo": albedo,
+        "roughness": roughness,
+        "metallic": metallic,
+        "scales": scales,
+        "rotations": rotations,
+        "cov3D_precomp": None,
+        "derive_normal": derive_normal,
+    }
+    try:
+        rasterizer_sig = inspect.signature(rasterizer.forward)
+        supported_rasterizer_fields = set(rasterizer_sig.parameters.keys())
+        rasterizer_kwargs = {
+            key: value for key, value in rasterizer_kwargs.items() if key in supported_rasterizer_fields
+        }
+    except (TypeError, ValueError):
+        pass
 
-    normal_map_from_depth = _depth_to_normal(depth_map, viewpoint_camera) if derive_normal else torch.zeros_like(normal_map)
+    raster_outputs = rasterizer(**rasterizer_kwargs)
+    if not isinstance(raster_outputs, tuple):
+        raise RuntimeError("Unexpected rasterizer output type; expected a tuple of G-buffer tensors.")
+    if len(raster_outputs) not in (8, 9):
+        raise RuntimeError(
+            "Current diff_gaussian_rasterization build returned "
+            f"{len(raster_outputs)} outputs, but this PBR pipeline expects 8 or 9 "
+            "(with optional normal_from_depth). "
+            "Please use the GS-IR-compatible rasterizer build."
+        )
+
+    if len(raster_outputs) == 9:
+        (
+            rendered_image,
+            radii,
+            opacity_map,
+            depth_map,
+            normal_map_from_depth,
+            normal_map,
+            albedo_map,
+            roughness_map,
+            metallic_map,
+        ) = raster_outputs
+    else:
+        (
+            rendered_image,
+            radii,
+            opacity_map,
+            depth_map,
+            normal_map,
+            albedo_map,
+            roughness_map,
+            metallic_map,
+        ) = raster_outputs
+        normal_map_from_depth = (
+            _depth_to_normal(depth_map, viewpoint_camera) if derive_normal else torch.zeros_like(normal_map)
+        )
     normal_map = torch.where(
         torch.norm(normal_map, dim=0, keepdim=True) > 0,
         F.normalize(normal_map, p=2, dim=0),
